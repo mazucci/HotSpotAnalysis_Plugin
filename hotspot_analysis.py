@@ -25,22 +25,20 @@ from PyQt4.QtGui import QAction, QIcon, QFileDialog, QComboBox, QFrame, QLineEdi
 from qgis.core import QgsMapLayerRegistry, QgsVectorLayer
 # Initialize Qt resources from file resources.py
 import resources
+import resources_rc
 # Import the code for the dialog
 from hotspot_analysis_dialog import HotspotAnalysisDialog
 import os.path
 
 import pysal
 from pysal.esda.getisord import *
-
 from pysal.weights.Distance import DistanceBand
-import numpy
-import shapefile
-import csv
-import sys
-import os
-import collections
 
+import numpy
 import sys
+
+from osgeo import ogr, gdal 
+
 
 class NullWriter(object):
     def write(self, value): pass
@@ -237,10 +235,9 @@ class HotspotAnalysis:
         self.dlg.lineEdit.clear()
         self.dlg.lineEditThreshold.clear()
         self.dlg.comboBox_C.clear()
-        self.dlg.comboBox_X.clear()
-        self.dlg.comboBox_Y.clear()
         self.dlg.lineEditThreshold.setEnabled(True)
         self.dlg.checkBox.setChecked(False)
+        self.dlg.checkBox_2.setChecked(False)
         self.dlg.lineEdit_minT.setEnabled(False)
         self.dlg.lineEdit_maxT.setEnabled(False)
         self.dlg.lineEdit_dist.setEnabled(False)
@@ -253,35 +250,78 @@ class HotspotAnalysis:
         
     def clear_fields(self):
         """Clearing the fields when layers are changed"""
-        self.dlg.comboBox_X.clear()
-        self.dlg.comboBox_Y.clear()
         self.dlg.comboBox_C.clear()
         
             
-    def write_file(self,filename,sf,lg_star,field_X,field_Y,field_C,X,Y,C,layerName):
-        """Writing the csv file into the mentioned directory"""
-        wr = shapefile.Writer(shapefile.POINT)
-        wr.field('X-Cord','F','20')
-        wr.field('Y-cord','F','20')
-        wr.field('Count','I')
-        wr.field('Z-score','F','20')
-        wr.field('p-value','F','20')
-        for idx, rec in enumerate(sf.records()):
-            wr.point(rec[X], rec[Y])
-            wr.record(rec[X], rec[Y], rec[C], lg_star.z_sim[idx], lg_star.p_z_sim[idx]*2.0)
-        wr.save(filename)
-        (path_prj,ext) = layerName.split('.')
-        shapeprj_path = path_prj+'.prj'
-        #identifying the epsg of input prj file
-        prj_file = open(shapeprj_path, 'r')
-        epsg = prj_file.read()
-        #create the PRJ file
-        prj = open("%s.prj" % filename, "w")
-        prj.write(epsg)
-        prj.close()
+    def write_file(self,filename,sf,lg_star,field_C,C,layerName,inLayer,inDataSource,threshold1):
+        """Writing the output shapefile into the mentioned directory"""
+        outDriver = ogr.GetDriverByName("ESRI Shapefile")
         
-        self.success_msg()
-        new_layer = self.iface.addVectorLayer(filename+".shp", "HotSpot_Output", "ogr")
+        layerName=layerName.split('.')
+        layerName.pop()
+        layerName='.'.join(layerName)	
+        
+        outShapefile = filename+".shp"
+        
+        # Remove eventually alrady exisiting output 
+        if os.path.exists(outShapefile):
+            outDriver.DeleteDataSource(outShapefile)
+            
+        # Create the output shapefile
+        outDataSource = outDriver.CreateDataSource(outShapefile)
+        outLayer = outDataSource.CreateLayer("output",  inLayer.GetSpatialRef(), inLayer.GetLayerDefn().GetGeomType())
+    
+        # Add input Layer Fields to the output Layer
+        inLayerDefn = inLayer.GetLayerDefn()
+        for i in range(0, inLayerDefn.GetFieldCount()):
+            fieldDefn = inLayerDefn.GetFieldDefn(i)
+            outLayer.CreateField(fieldDefn)
+
+        ##
+        # Add additional fields - for more types other than Strings take a look at http://pcjericks.github.io/py-gdalogr-cookbook/layers.html#create-a-new-shapefile-and-add-data
+        ##
+
+        # Add empty field to store Pysal results
+        Z_field = ogr.FieldDefn("Z-score", ogr.OFTReal)
+        Z_field.SetWidth(15)
+        Z_field.SetPrecision(10)
+        outLayer.CreateField(Z_field)
+
+        p_field = ogr.FieldDefn("p-value", ogr.OFTReal)
+        p_field.SetWidth(15)
+        p_field.SetPrecision(10)
+        outLayer.CreateField(p_field)
+
+        # Get the output Layer's Feature Definition
+        outLayerDefn = outLayer.GetLayerDefn()
+        # Get the input Layer's Feature Definition
+        inLayerDefn  = inLayer.GetLayerDefn()
+
+        # Add features to the ouput Layer
+        for i in range(0, inLayer.GetFeatureCount()):
+            # Get the input Feature
+            inFeature = inLayer.GetFeature(i)
+            # Create output Feature
+            outFeature = ogr.Feature(outLayerDefn)
+            # Add field values from input Layer
+            for j in range(0, inLayerDefn.GetFieldCount()):
+                outFeature.SetField(outLayerDefn.GetFieldDefn(j).GetNameRef(), inFeature.GetField(j))
+            # Set geometry
+            geom = inFeature.GetGeometryRef()
+            outFeature.SetGeometry(geom)
+            # Add Z-scores and p-values to their field column 
+            outFeature.SetField("Z-score", lg_star.z_sim[i])
+            outFeature.SetField("p-value", lg_star.p_z_sim[i]*2)
+            # Add new feature to output Layer
+            outLayer.CreateFeature(outFeature)
+
+        # Close DataSources
+        inDataSource.Destroy()
+        outDataSource.Destroy()
+    
+        
+        self.success_msg(threshold1)
+        new_layer = self.iface.addVectorLayer(filename+".shp", str(os.path.basename(os.path.normpath(filename))), "ogr")
         if not new_layer:
             QMessageBox.information(self.dlg, self.tr("New Layer"),self.tr("Layer Cannot be Loaded"),QMessageBox.Ok)
         self.clear_ui() 
@@ -293,19 +333,19 @@ class HotspotAnalysis:
         fieldnames = []
         fieldnames = [field.name() for field in selectedLayer.pendingFields()]
         self.clear_fields()
-        self.dlg.comboBox_X.addItems(fieldnames)
-        self.dlg.comboBox_Y.addItems(fieldnames)
         self.dlg.comboBox_C.addItems(fieldnames)
+        (path,layer_id)=selectedLayer.dataProvider().dataSourceUri().split('|')
+        thresh = pysal.min_threshold_dist_from_shapefile(path)
+        self.dlg.lineEditThreshold.setText(str(int(thresh)))
         
     def error_msg(self):
         """Message to report missing fields"""
         self.clear_ui()
         QMessageBox.warning(self.dlg.show(), self.tr("HotspotAnalysis:Warning"),self.tr("Please specify input fields properly"),QMessageBox.Ok)
-        self.run()
         
-    def success_msg(self):
+    def success_msg(self,distance):
         """Message to report succesful file creation"""
-        QMessageBox.information(self.dlg, self.tr("HotspotAnalysis:Success"),self.tr("File is generated Succesfully"),QMessageBox.Ok)
+        QMessageBox.information(self.dlg, self.tr("HotspotAnalysis:Success"),self.tr("File is generated Succesfully (Distance used = "+ str(distance)+")"),QMessageBox.Ok)
         
     def validator(self):
         """Validator to Check whether the inputs are given properly"""
@@ -333,12 +373,12 @@ class HotspotAnalysis:
             selectedLayer = layers_shp[selectedLayerIndex]
             fieldnames = [field.name() for field in selectedLayer.pendingFields()]#fetching fieldnames of layer
             self.clear_fields()
-            self.dlg.comboBox_X.addItems(fieldnames)#adding fields to comboBox
-            self.dlg.comboBox_Y.addItems(fieldnames)
             self.dlg.comboBox_C.addItems(fieldnames)
             self.dlg.comboBox.activated.connect(lambda:self.load_comboBox(layers_shp))
             self.dlg.comboBox.currentIndexChanged.connect(lambda:self.load_comboBox(layers_shp))
             self.dlg.checkBox.toggled.connect(self.optimizedThreshold)#checkbox toggle event
+            self.load_comboBox(layers_shp)
+
         
         # show the dialog
             self.dlg.show()		
@@ -349,23 +389,28 @@ class HotspotAnalysis:
                 selectedLayerIndex = self.dlg.comboBox.currentIndex()
                 selectedLayer = layers_shp[selectedLayerIndex]
                 layerName = selectedLayer.dataProvider().dataSourceUri()
-                X = selectedLayer.fieldNameIndex(self.dlg.comboBox_X.currentText())
-                Y = selectedLayer.fieldNameIndex(self.dlg.comboBox_Y.currentText())
                 C = selectedLayer.fieldNameIndex(self.dlg.comboBox_C.currentText())
                 filename = self.dlg.lineEdit.text()
                 (path,layer_id) = layerName.split('|')
-                sf = shapefile.Reader(path)
-                shapes = sf.shapes()
-                t = ()
-                # create a tuple of tuple (x,y) coordinates - like "points" vector in the previous commment
-                for shape in shapes:
-                    ps = (shape.points[0][X], shape.points[0][Y]) # cordinate x and y  
-                    t = t + (ps,)
+            
                 
-                u=[]
-                for obj in sf.records():
-                    u.append(obj[C])
-                y = numpy.array(u)#pointcount
+                inDriver = ogr.GetDriverByName("ESRI Shapefile")
+                inDataSource = inDriver.Open(path, 0)
+                inLayer = inDataSource.GetLayer()
+                               
+                t = ()
+                for feature in inLayer:
+                    geometry = feature.GetGeometryRef()
+                    xy= (geometry.GetX(), geometry.GetY())
+                    t = t+ (xy,)
+                
+                u=[] 
+                for i in range(0, inLayer.GetFeatureCount()):
+                    geometry = inLayer.GetFeature(i)
+                    u.append(geometry.GetField(C))    
+                    
+                y = numpy.array(u)#point attribute
+                               
                 if self.dlg.checkBox.isChecked() == 0:#if threshold is given
                     threshold1 = int(self.dlg.lineEditThreshold.text())
                 else:#if user needs to optimize threshold
@@ -383,11 +428,18 @@ class HotspotAnalysis:
                             mx_moran = moran.z_norm
                     threshold1 = int(mx_i)
                 w = DistanceBand(t,threshold1, p=2, binary=False)
+                if self.dlg.checkBox_2.isChecked() == 1:
+					w_type = "r"
+                else:
+					w_type = "B"
                 lg_star = G_Local(y,w,transform='B',star=True)
-                self.write_file(filename,sf,lg_star,self.dlg.comboBox_X.currentText(),self.dlg.comboBox_Y.currentText(),self.dlg.comboBox_C.currentText(),X,Y,C,layerName)
+                self.write_file(filename,inLayer,lg_star,self.dlg.comboBox_C.currentText(),C,layerName, inLayer, inDataSource, threshold1)
+                # assign the style to the output layer on QGIS 
+                self.iface.activeLayer().loadNamedStyle(os.path.dirname(__file__) + "/hotspots_class.qml")
             elif result and (self.validator()==0):
                 self.error_msg()
             else:
                 self.clear_ui()
                 pass
               
+                     
